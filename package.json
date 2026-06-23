@@ -1,0 +1,46 @@
+{
+  "name": "easek",
+  "version": "0.0.1",
+  "description": "Easek Tampermonkey userscript",
+  "main": "",
+  "packageManager": "pnpm@11.5.2",
+  "scripts": {
+    "start": "vite --mode development --host 127.0.0.1",
+    "dev": "concurrently -k -n server,bundle \"vite --mode development --host 127.0.0.1\" \"vite build --mode development --watch\"",
+    "build:dev": "vite build --mode development",
+    "build": "pnpm lint:fix && vite build --mode production",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint --ext .ts --ext .tsx src/",
+    "lint:fix": "pnpm lint --fix"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/forestsheep911/easek.git"
+  },
+  "keywords": [
+    "TamperMonkey",
+    "TypeScript"
+  ],
+  "author": "forestsheep911",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/forestsheep911/easek/issues"
+  },
+  "homepage": "https://github.com/forestsheep911/easek",
+  "devDependencies": {
+    "@types/node": "^20.19.1",
+    "@types/tampermonkey": "^4.0.5",
+    "@typescript-eslint/eslint-plugin": "^5.19.0",
+    "@typescript-eslint/parser": "^5.19.0",
+    "concurrently": "^9.2.1",
+    "eslint": "^8.13.0",
+    "eslint-config-prettier": "^8.5.0",
+    "eslint-plugin-html": "^6.2.0",
+    "eslint-plugin-prettier": "^4.0.0",
+    "less": "^4.1.2",
+    "prettier": "^2.6.2",
+    "typescript": "^5.8.3",
+    "vite": "^5.4.19"
+  },
+  "dependencies": {}
+}
