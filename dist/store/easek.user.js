@@ -29,7 +29,8 @@
   const INITIAL_MOUNT_DELAY = 3e3;
   const MARK_INTERVAL_MS = 600;
   const READ_NEXT_BATCH_DELAY_MS = 800;
-  const MAX_NOTIFICATION_ROUNDS = 20;
+  const DEFAULT_MAX_NOTIFICATION_ROUNDS = 20;
+  const ALL_MAX_NOTIFICATION_ROUNDS = 100;
   const DEFAULT_MAX_NOTIFICATIONS_PER_RUN = 1e3;
   const ALL_MAX_NOTIFICATIONS_PER_RUN = 5e3;
   const DEFAULT_MARK_BATCH_SIZE = 1;
@@ -203,6 +204,9 @@
   const getMaxNotificationsPerRun = (scope) => {
     return scope === "#/ntf/all" ? ALL_MAX_NOTIFICATIONS_PER_RUN : DEFAULT_MAX_NOTIFICATIONS_PER_RUN;
   };
+  const getMaxNotificationRounds = (scope) => {
+    return scope === "#/ntf/all" ? ALL_MAX_NOTIFICATION_ROUNDS : DEFAULT_MAX_NOTIFICATION_ROUNDS;
+  };
   const getMarkBatchSize = (scope) => {
     return scope === "#/ntf/all" ? ALL_MARK_BATCH_SIZE : DEFAULT_MARK_BATCH_SIZE;
   };
@@ -274,15 +278,16 @@
   const collectUnreadMessages = async (firstPage, requestToken, scope, modal) => {
     const messagesByKey = /* @__PURE__ */ new Map();
     const maxNotifications = getMaxNotificationsPerRun(scope);
+    const maxRounds = getMaxNotificationRounds(scope);
     let page = firstPage;
     let pageIndex = 1;
-    while (pageIndex <= MAX_NOTIFICATION_ROUNDS) {
+    while (pageIndex <= maxRounds) {
       page.messages.forEach((message) => {
         messagesByKey.set(getMessageKey(message), message);
       });
       const reachedCountLimit = messagesByKey.size >= maxNotifications;
       modal.setBusy(`已读取 ${messagesByKey.size} 条未读通知，正在检查是否还有下一批...`);
-      if (!page.hasMore || !page.nextBaseId || pageIndex >= MAX_NOTIFICATION_ROUNDS || reachedCountLimit) {
+      if (!page.hasMore || !page.nextBaseId || pageIndex >= maxRounds || reachedCountLimit) {
         return {
           messages: Array.from(messagesByKey.values()).slice(0, maxNotifications),
           reachedLimit: page.hasMore || reachedCountLimit
@@ -584,9 +589,10 @@
   const showConfirmModal = (count, scope, reachedLimit) => {
     const scopeLabel = scope === "#/ntf/all" ? "全部" : "与我相关";
     const maxNotifications = getMaxNotificationsPerRun(scope);
+    const maxRounds = getMaxNotificationRounds(scope);
     const batchSize = getMarkBatchSize(scope);
     const submitText = batchSize > 1 ? `每次最多 ${batchSize} 条` : "逐条";
-    const extraText = scope === "#/ntf/all" ? reachedLimit ? `<br>未读通知很多，本次最多处理 ${maxNotifications} 条，完成后可再次点击继续处理后续通知。` : "<br>已预读取当前范围内的全部未读通知。" : "";
+    const extraText = scope === "#/ntf/all" ? reachedLimit ? `<br>未读通知很多，本次最多读取 ${maxRounds} 页、处理 ${maxNotifications} 条，完成后可再次点击继续处理后续通知。` : "<br>已预读取当前范围内的全部未读通知。" : "";
     const { modal, controller } = createProgressModal(
       `当前发现 ${count} 条“${scopeLabel}”未读通知。是否标记为已读？${extraText}<br>确认后会按 ${MARK_INTERVAL_MS}ms 间隔${submitText}提交，避免一次性请求过多。`,
       '<button class="easek-modal-button" type="button" data-action="cancel">取消</button><button class="easek-modal-button easek-modal-button-primary" type="button" data-action="start">全部标记为已读</button>'
@@ -797,6 +803,15 @@
       method: "floating"
     };
   };
+  const isPreferredMountMethod = (method) => {
+    return method === "read-toggle" || method === "new-design-bulk-operation";
+  };
+  const placeButton = (button, mountTarget) => {
+    button.classList.toggle("easek-floating", mountTarget.floating);
+    button.classList.toggle("easek-standalone", mountTarget.method !== "read-toggle");
+    button.dataset.mountMethod = mountTarget.method;
+    mountTarget.target.insertAdjacentElement(mountTarget.position, button);
+  };
   const mountButton = () => {
     if (!isTargetPage()) {
       activeButton?.remove();
@@ -804,9 +819,19 @@
       document.getElementById(STATUS_ID)?.remove();
       return;
     }
-    if (document.getElementById(BUTTON_ID)) {
+    const existingButton = document.getElementById(BUTTON_ID);
+    if (existingButton) {
+      const mountTarget2 = findMountTarget();
+      const previousMethod = existingButton.dataset.mountMethod;
+      placeButton(existingButton, mountTarget2);
       const status2 = document.getElementById(STATUS_ID);
       status2?.remove();
+      if (previousMethod !== mountTarget2.method) {
+        log(`placed existing mark-all-read button by ${mountTarget2.method}`, {
+          hash: location.hash,
+          href: location.href
+        });
+      }
       return;
     }
     if (!document.body) {
@@ -824,12 +849,6 @@
     button.dataset.disabled = "false";
     button.textContent = "全部已读";
     button.title = "把当前与我相关的未读通知标记为已读";
-    if (mountTarget.floating) {
-      button.classList.add("easek-floating");
-    }
-    if (mountTarget.method !== "read-toggle") {
-      button.classList.add("easek-standalone");
-    }
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -844,7 +863,7 @@
       void handleMarkAllRead(button);
     });
     activeButton = button;
-    mountTarget.target.insertAdjacentElement(mountTarget.position, button);
+    placeButton(button, mountTarget);
     const status = document.getElementById(STATUS_ID);
     status?.remove();
     log(`mounted mark-all-read button by ${mountTarget.method}`, {
@@ -907,17 +926,21 @@
         if (!isTargetPage()) {
           return;
         }
-        if (!document.getElementById(BUTTON_ID)) {
+        const button = document.getElementById(BUTTON_ID);
+        if (!button || !isPreferredMountMethod(button.dataset.mountMethod)) {
           scheduleMount();
         }
       }, 1e3);
     }
     if (!targetObserver && document.body) {
       targetObserver = new MutationObserver(() => {
-        if (!isTargetPage() || document.getElementById(BUTTON_ID)) {
+        if (!isTargetPage()) {
           return;
         }
-        scheduleMount(100);
+        const button = document.getElementById(BUTTON_ID);
+        if (!button || !isPreferredMountMethod(button.dataset.mountMethod)) {
+          scheduleMount(100);
+        }
       });
       targetObserver.observe(document.body, {
         childList: true,
