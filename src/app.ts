@@ -1,12 +1,17 @@
-const TARGET_HASH = '#/ntf/mention'
+const TARGET_HASHES = ['#/ntf/mention', '#/ntf/all'] as const
 const BUTTON_ID = 'easek-mark-all-read'
 const STYLE_ID = 'easek-mark-all-read-style'
 const STATUS_ID = 'easek-dev-status'
 const MODAL_ID = 'easek-mark-all-read-modal'
 const LOG_PREFIX = '[Easek]'
 const INITIAL_MOUNT_DELAY = 3000
-const MARK_BATCH_SIZE = 1
 const MARK_INTERVAL_MS = 600
+const READ_NEXT_BATCH_DELAY_MS = 800
+const MAX_NOTIFICATION_ROUNDS = 20
+const DEFAULT_MAX_NOTIFICATIONS_PER_RUN = 1000
+const ALL_MAX_NOTIFICATIONS_PER_RUN = 5000
+const DEFAULT_MARK_BATCH_SIZE = 1
+const ALL_MARK_BATCH_SIZE = 20
 const TOKEN_MESSAGE_TYPE = 'easek-request-token-result'
 const CLICK_HANDLER_FLAG = 'easekClickHandlerInstalled'
 
@@ -17,9 +22,24 @@ type NotificationMessage = {
 }
 
 type UnknownRecord = Record<string, unknown>
+type NotificationScope = (typeof TARGET_HASHES)[number]
+type NotificationPage = {
+  messages: NotificationMessage[]
+  hasMore: boolean
+  nextBaseId: string
+}
+type CollectedUnreadMessages = {
+  messages: NotificationMessage[]
+  reachedLimit: boolean
+}
+type MarkAllResult = {
+  totalMarked: number
+  reachedLimit: boolean
+}
 
 type NotificationListResponse = {
   result?: {
+    hasMore?: boolean
     ntf?: Array<{
       id?: string
       groupKey?: string
@@ -43,7 +63,11 @@ type CybozuWindow = Window &
   }
 
 let capturedRequestToken = ''
-let activeButton: HTMLButtonElement | null = null
+let activeButton: HTMLElement | null = null
+let featureInstalled = false
+let mountTimer = 0
+let retryTimer = 0
+let targetObserver: MutationObserver | null = null
 
 type ProgressModal = {
   close: () => void
@@ -244,20 +268,52 @@ const collectMessages = (value: unknown, result: NotificationMessage[] = [], inh
   return result
 }
 
-const getUnreadMentionMessages = async (requestToken: string) => {
-  const listResponse = await postKintoneApi<NotificationListResponse>('/k/api/ntf/list.json', {
+const getCurrentNotificationScope = (): NotificationScope | null => {
+  return TARGET_HASHES.find((hash) => location.hash.startsWith(hash) || location.href.includes(`/k/${hash}`)) || null
+}
+
+const getMaxNotificationsPerRun = (scope: NotificationScope) => {
+  return scope === '#/ntf/all' ? ALL_MAX_NOTIFICATIONS_PER_RUN : DEFAULT_MAX_NOTIFICATIONS_PER_RUN
+}
+
+const getMarkBatchSize = (scope: NotificationScope) => {
+  return scope === '#/ntf/all' ? ALL_MARK_BATCH_SIZE : DEFAULT_MARK_BATCH_SIZE
+}
+
+const getUnreadMessagePage = async (
+  requestToken: string,
+  scope: NotificationScope,
+  baseId = '',
+): Promise<NotificationPage> => {
+  const body: UnknownRecord = {
     checkIgnoreMention: true,
     readType: 'UNREAD',
-    mentioned: true,
-    checkNew: false,
     __REQUEST_TOKEN__: requestToken,
-  })
+  }
+
+  if (baseId) {
+    body.baseId = baseId
+  } else {
+    body.checkNew = false
+  }
+
+  if (scope === '#/ntf/mention') {
+    body.mentioned = true
+  }
+
+  const listResponse = await postKintoneApi<NotificationListResponse>('/k/api/ntf/list.json', body)
 
   log('raw unread list response', listResponse)
 
   const directMessages =
     listResponse.result?.ntf
-      ?.filter((item) => item.read === false && item.mention !== false && item.id && item.groupKey)
+      ?.filter((item) => {
+        if (item.read !== false || !item.id || !item.groupKey) {
+          return false
+        }
+
+        return scope === '#/ntf/all' || item.mention !== false
+      })
       .map((item) => ({
         read: true,
         groupKey: item.groupKey as string,
@@ -265,7 +321,11 @@ const getUnreadMentionMessages = async (requestToken: string) => {
       })) || []
 
   if (directMessages.length > 0) {
-    return directMessages
+    return {
+      messages: directMessages,
+      hasMore: listResponse.result?.hasMore === true,
+      nextBaseId: listResponse.result?.ntf?.at(-1)?.id || '',
+    }
   }
 
   const messages = collectMessages(listResponse)
@@ -274,7 +334,11 @@ const getUnreadMentionMessages = async (requestToken: string) => {
     uniqueMessages.set(`${message.groupKey}:${message.baseId}`, message)
   })
 
-  return Array.from(uniqueMessages.values())
+  return {
+    messages: Array.from(uniqueMessages.values()),
+    hasMore: listResponse.result?.hasMore === true,
+    nextBaseId: listResponse.result?.ntf?.at(-1)?.id || '',
+  }
 }
 
 const getUnreadMentionIds = async (requestToken: string) => {
@@ -303,15 +367,69 @@ const markMessagesRead = async (messages: NotificationMessage[], requestToken: s
   })
 }
 
-const markMessagesReadSlowly = async (messages: NotificationMessage[], requestToken: string, modal: ProgressModal) => {
-  let done = 0
+const getMessageKey = (message: NotificationMessage) => `${message.groupKey || ''}:${message.baseId}`
 
-  for (let index = 0; index < messages.length; index += MARK_BATCH_SIZE) {
-    const batch = messages.slice(index, index + MARK_BATCH_SIZE)
-    modal.setProgress(done, messages.length, `标记进度 ${done}/${messages.length}`)
+const collectUnreadMessages = async (
+  firstPage: NotificationPage,
+  requestToken: string,
+  scope: NotificationScope,
+  modal: ProgressModal,
+): Promise<CollectedUnreadMessages> => {
+  const messagesByKey = new Map<string, NotificationMessage>()
+  const maxNotifications = getMaxNotificationsPerRun(scope)
+  let page = firstPage
+  let pageIndex = 1
+
+  while (pageIndex <= MAX_NOTIFICATION_ROUNDS) {
+    page.messages.forEach((message) => {
+      messagesByKey.set(getMessageKey(message), message)
+    })
+
+    const reachedCountLimit = messagesByKey.size >= maxNotifications
+    modal.setBusy(`已读取 ${messagesByKey.size} 条未读通知，正在检查是否还有下一批...`)
+
+    if (!page.hasMore || !page.nextBaseId || pageIndex >= MAX_NOTIFICATION_ROUNDS || reachedCountLimit) {
+      return {
+        messages: Array.from(messagesByKey.values()).slice(0, maxNotifications),
+        reachedLimit: page.hasMore || reachedCountLimit,
+      }
+    }
+
+    await wait(READ_NEXT_BATCH_DELAY_MS)
+    page = await getUnreadMessagePage(requestToken, scope, page.nextBaseId)
+    pageIndex += 1
+    log('next unread page loaded', {
+      scope,
+      pageIndex,
+      count: page.messages.length,
+      hasMore: page.hasMore,
+      nextBaseId: page.nextBaseId,
+    })
+  }
+
+  return {
+    messages: Array.from(messagesByKey.values()).slice(0, maxNotifications),
+    reachedLimit: true,
+  }
+}
+
+const markMessagesReadSlowly = async (
+  messages: NotificationMessage[],
+  requestToken: string,
+  modal: ProgressModal,
+  scope: NotificationScope,
+  markedBefore = 0,
+) => {
+  let done = 0
+  const knownTotal = markedBefore + messages.length
+  const batchSize = getMarkBatchSize(scope)
+
+  for (let index = 0; index < messages.length; index += batchSize) {
+    const batch = messages.slice(index, index + batchSize)
+    modal.setProgress(markedBefore + done, knownTotal, `标记进度 ${markedBefore + done}/${knownTotal}`)
     await markMessagesRead(batch, requestToken)
     done += batch.length
-    modal.setProgress(done, messages.length, `标记进度 ${done}/${messages.length}`)
+    modal.setProgress(markedBefore + done, knownTotal, `标记进度 ${markedBefore + done}/${knownTotal}`)
 
     if (done < messages.length) {
       await wait(MARK_INTERVAL_MS)
@@ -319,9 +437,21 @@ const markMessagesReadSlowly = async (messages: NotificationMessage[], requestTo
   }
 }
 
-const setButtonState = (button: HTMLButtonElement, text: string, disabled: boolean) => {
+const markAllUnreadMessages = async (
+  messages: NotificationMessage[],
+  requestToken: string,
+  modal: ProgressModal,
+  scope: NotificationScope,
+): Promise<MarkAllResult> => {
+  await markMessagesReadSlowly(messages, requestToken, modal, scope)
+  return { totalMarked: messages.length, reachedLimit: false }
+}
+
+const setButtonState = (button: HTMLElement, text: string, disabled: boolean) => {
   button.textContent = text
-  button.disabled = disabled
+  button.dataset.disabled = disabled ? 'true' : 'false'
+  button.setAttribute('aria-disabled', disabled ? 'true' : 'false')
+  button.classList.toggle('easek-disabled', disabled)
 }
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
@@ -346,9 +476,7 @@ const maskRequestToken = (body: UnknownRecord) => {
   }
 }
 
-const isTargetPage = () => {
-  return location.hash.startsWith(TARGET_HASH) || location.href.includes('/k/#/ntf/mention')
-}
+const isTargetPage = () => getCurrentNotificationScope() !== null
 
 const injectStyle = () => {
   if (document.getElementById(STYLE_ID)) {
@@ -360,28 +488,30 @@ const injectStyle = () => {
   style.textContent = `
     #${BUTTON_ID} {
       box-sizing: border-box;
-      display: inline-block;
-      height: 24px;
-      margin-left: 8px;
-      padding: 0 10px;
-      border: 1px solid #c8d6df;
-      border-radius: 3px;
-      background: #ffffff;
-      color: #333333;
-      font: 12px/22px Arial, "Microsoft YaHei", sans-serif;
+      min-width: 78px;
+      margin: 0;
+      font-family: Arial, "Microsoft YaHei", sans-serif;
       cursor: pointer;
-      vertical-align: middle;
       white-space: nowrap;
+      outline: none;
+      box-shadow: none !important;
+      -webkit-tap-highlight-color: transparent;
     }
 
     #${BUTTON_ID}:hover {
-      background: #f2f7fb;
-      border-color: #8db4cf;
+      background: #f7f7f7;
     }
 
-    #${BUTTON_ID}:disabled {
+    #${BUTTON_ID}:focus,
+    #${BUTTON_ID}:focus-visible {
+      outline: none !important;
+      box-shadow: none !important;
+    }
+
+    #${BUTTON_ID}.easek-disabled {
       cursor: default;
       opacity: 0.7;
+      pointer-events: none;
     }
 
     #${BUTTON_ID}.easek-floating {
@@ -390,6 +520,28 @@ const injectStyle = () => {
       right: 16px;
       z-index: 2147483647;
       box-shadow: 0 4px 16px rgba(0, 0, 0, 0.16);
+    }
+
+    #${BUTTON_ID}.easek-standalone {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 32px;
+      min-width: 88px;
+      margin-left: 12px;
+      padding: 0 10px;
+      border: 1px solid #d7d7d7;
+      border-radius: 4px;
+      background: #ffffff;
+      color: #333333;
+      font-size: 12px;
+      line-height: 30px;
+      vertical-align: middle;
+    }
+
+    #${BUTTON_ID}.easek-standalone:hover {
+      background: #f7f7f7;
+      border-color: #9fc3dd;
     }
 
     #${STATUS_ID} {
@@ -506,6 +658,10 @@ const injectStyle = () => {
 }
 
 const showStatus = (text: string) => {
+  if (PRODUCTION) {
+    return
+  }
+
   if (!document.body) {
     return
   }
@@ -593,9 +749,19 @@ const showBusyModal = (messageText: string) => {
   return createProgressModal(`<span class="easek-modal-spinner"></span>${messageText}`).controller
 }
 
-const showConfirmModal = (count: number) => {
+const showConfirmModal = (count: number, scope: NotificationScope, reachedLimit: boolean) => {
+  const scopeLabel = scope === '#/ntf/all' ? '全部' : '与我相关'
+  const maxNotifications = getMaxNotificationsPerRun(scope)
+  const batchSize = getMarkBatchSize(scope)
+  const submitText = batchSize > 1 ? `每次最多 ${batchSize} 条` : '逐条'
+  const extraText =
+    scope === '#/ntf/all'
+      ? reachedLimit
+        ? `<br>未读通知很多，本次最多处理 ${maxNotifications} 条，完成后可再次点击继续处理后续通知。`
+        : '<br>已预读取当前范围内的全部未读通知。'
+      : ''
   const { modal, controller } = createProgressModal(
-    `发现 ${count} 条“与我相关”的未读通知。是否全部标记为已读？<br>确认后会按 ${MARK_INTERVAL_MS}ms 间隔逐条提交，避免一次性请求过多。`,
+    `当前发现 ${count} 条“${scopeLabel}”未读通知。是否标记为已读？${extraText}<br>确认后会按 ${MARK_INTERVAL_MS}ms 间隔${submitText}提交，避免一次性请求过多。`,
     '<button class="easek-modal-button" type="button" data-action="cancel">取消</button><button class="easek-modal-button easek-modal-button-primary" type="button" data-action="start">全部标记为已读</button>',
   )
 
@@ -622,7 +788,16 @@ const showConfirmModal = (count: number) => {
   return { controller, waitForStart }
 }
 
-const handleMarkAllRead = async (button: HTMLButtonElement) => {
+const handleMarkAllRead = async (button: HTMLElement) => {
+  if (button.dataset.disabled === 'true') {
+    return
+  }
+
+  const scope = getCurrentNotificationScope()
+  if (!scope) {
+    return
+  }
+
   log('mark-all-read clicked')
   setButtonState(button, '准备中...', true)
   const busyModal = showBusyModal('正在读取未读通知...')
@@ -638,22 +813,42 @@ const handleMarkAllRead = async (button: HTMLButtonElement) => {
   try {
     log('request token ready')
     setButtonState(button, '读取中...', true)
-    let messages = await getUnreadMentionMessages(requestToken)
+    const firstPage = await getUnreadMessagePage(requestToken, scope)
+    let messages = firstPage.messages
+    let reachedReadLimit = false
     log('unread messages loaded', {
+      scope,
       count: messages.length,
+      hasMore: firstPage.hasMore,
+      nextBaseId: firstPage.nextBaseId,
       messages,
     })
 
-    if (messages.length === 0) {
+    if (scope === '#/ntf/mention' && messages.length === 0) {
       const ids = await getUnreadMentionIds(requestToken)
       messages = ids.map((baseId) => ({
         read: true,
         baseId,
       }))
       log('unread messages loaded from countMention fallback', {
+        scope,
         count: messages.length,
         messages,
       })
+    }
+
+    if (scope === '#/ntf/all' && messages.length > 0 && firstPage.hasMore) {
+      const allUnread = await collectUnreadMessages(firstPage, requestToken, scope, busyModal)
+      messages = allUnread.messages
+      reachedReadLimit = allUnread.reachedLimit
+      log('all unread pages collected', {
+        scope,
+        count: messages.length,
+        reachedLimit: allUnread.reachedLimit,
+      })
+      if (allUnread.reachedLimit) {
+        busyModal.setBusy(`已读取 ${messages.length} 条未读通知，达到本次处理保护上限。`)
+      }
     }
 
     if (messages.length === 0) {
@@ -664,7 +859,7 @@ const handleMarkAllRead = async (button: HTMLButtonElement) => {
     }
 
     busyModal.close()
-    const { controller: modal, waitForStart } = showConfirmModal(messages.length)
+    const { controller: modal, waitForStart } = showConfirmModal(messages.length, scope, reachedReadLimit)
     currentModal = modal
     const shouldStart = await waitForStart
     if (!shouldStart) {
@@ -672,12 +867,18 @@ const handleMarkAllRead = async (button: HTMLButtonElement) => {
       return
     }
 
-    setButtonState(button, `标记 0/${messages.length}`, true)
+    setButtonState(button, '标记中...', true)
     modal.setProgress(0, messages.length, `准备按 ${MARK_INTERVAL_MS}ms 间隔标记 ${messages.length} 条通知...`)
-    await markMessagesReadSlowly(messages, requestToken, modal)
+    const result = await markAllUnreadMessages(messages, requestToken, modal, scope)
     log('mark read api completed')
     setButtonState(button, '已完成', false)
-    modal.setProgress(messages.length, messages.length, `已完成，共标记 ${messages.length} 条通知。页面即将刷新。`)
+    modal.setProgress(
+      result.totalMarked,
+      result.totalMarked,
+      reachedReadLimit || result.reachedLimit
+        ? `已完成本次上限，共标记 ${result.totalMarked} 条通知。页面即将刷新，后续可再次点击继续处理。`
+        : `已完成，共标记 ${result.totalMarked} 条通知。页面即将刷新。`,
+    )
     window.setTimeout(() => {
       modal.close()
       window.location.reload()
@@ -689,7 +890,79 @@ const handleMarkAllRead = async (button: HTMLButtonElement) => {
   }
 }
 
+const findNewDesignBulkOperationTarget = () => {
+  const switches = Array.from(document.querySelectorAll<HTMLElement>('button[role="switch"]'))
+
+  for (const switchButton of switches) {
+    const container = switchButton.closest<HTMLElement>('[data-disabled]')
+    const label = container?.querySelector<HTMLElement>('label')
+    if (label?.textContent?.trim() !== '批量操作') {
+      continue
+    }
+
+    const option = container?.parentElement
+    if (option) {
+      return option
+    }
+  }
+
+  const labels = Array.from(document.querySelectorAll<HTMLLabelElement>('label')).filter(
+    (label) => label.textContent?.trim() === '批量操作',
+  )
+
+  for (const label of labels) {
+    const option = label.closest<HTMLElement>('[class*="option"], [class*="container"]')
+    if (option) {
+      return option.parentElement || option
+    }
+  }
+
+  return null
+}
+
 const findMountTarget = () => {
+  const readToggle = document.querySelector<HTMLElement>('.gaia-argoui-ntf-readtoggleswitch')
+  if (readToggle) {
+    return {
+      target: readToggle,
+      position: 'beforeend' as const,
+      floating: false,
+      method: 'read-toggle',
+    }
+  }
+
+  const newDesignBulkOperation = findNewDesignBulkOperationTarget()
+  if (newDesignBulkOperation) {
+    return {
+      target: newDesignBulkOperation,
+      position: 'afterend' as const,
+      floating: false,
+      method: 'new-design-bulk-operation',
+    }
+  }
+
+  const newDesignTrialButton = document.querySelector<HTMLElement>('.gaia-argoui-ntf-new-design-header')
+  if (newDesignTrialButton?.parentElement) {
+    return {
+      target: newDesignTrialButton,
+      position: 'beforebegin' as const,
+      floating: false,
+      method: 'new-design-trial-button',
+    }
+  }
+
+  const newNotificationHeader = document.querySelector<HTMLElement>(
+    '[class*="ntf"][class*="header"], [class*="notification"][class*="header"]',
+  )
+  if (newNotificationHeader) {
+    return {
+      target: newNotificationHeader,
+      position: 'beforeend' as const,
+      floating: false,
+      method: 'notification-header',
+    }
+  }
+
   const readFilter = document.querySelector<HTMLElement>('.ocean-ntf-listheader-readfilter')
   if (readFilter) {
     return {
@@ -730,7 +1003,9 @@ const findMountTarget = () => {
 
 const mountButton = () => {
   if (!isTargetPage()) {
-    showStatus(`Easek loaded, waiting target page: ${location.hash || '(no hash)'}`)
+    activeButton?.remove()
+    activeButton = null
+    document.getElementById(STATUS_ID)?.remove()
     return
   }
 
@@ -747,15 +1022,32 @@ const mountButton = () => {
   injectStyle()
 
   const mountTarget = findMountTarget()
-  const button = document.createElement('button')
+  const button = document.createElement('div')
   button.id = BUTTON_ID
-  button.type = 'button'
+  button.className = 'gaia-argoui-toggleswitch-option'
+  button.setAttribute('role', 'button')
+  button.setAttribute('tabindex', '0')
+  button.setAttribute('aria-selected', 'false')
+  button.setAttribute('aria-disabled', 'false')
+  button.dataset.disabled = 'false'
   button.textContent = '全部已读'
   button.title = '把当前与我相关的未读通知标记为已读'
   if (mountTarget.floating) {
     button.classList.add('easek-floating')
   }
+  if (mountTarget.method !== 'read-toggle') {
+    button.classList.add('easek-standalone')
+  }
   button.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    void handleMarkAllRead(button)
+  })
+  button.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return
+    }
+
     event.preventDefault()
     event.stopPropagation()
     void handleMarkAllRead(button)
@@ -769,6 +1061,14 @@ const mountButton = () => {
     hash: location.hash,
     href: location.href,
   })
+}
+
+const scheduleMount = (delay = 0) => {
+  window.clearTimeout(mountTimer)
+  mountTimer = window.setTimeout(() => {
+    mountTimer = 0
+    mountButton()
+  }, delay)
 }
 
 const installClickHandler = () => {
@@ -786,7 +1086,7 @@ const installClickHandler = () => {
         return
       }
 
-      const button = target.closest<HTMLButtonElement>(`#${BUTTON_ID}`)
+      const button = target.closest<HTMLElement>(`#${BUTTON_ID}`)
       if (!button) {
         return
       }
@@ -799,12 +1099,86 @@ const installClickHandler = () => {
   )
 }
 
-const start = () => {
+const installFeature = () => {
+  if (featureInstalled) {
+    return
+  }
+
+  featureInstalled = true
   installTokenBridge()
   installTokenCapture()
   installClickHandler()
+}
+
+const enterTargetPage = () => {
+  installFeature()
   requestTokenFromPageContext()
 
+  log('target page active', {
+    hash: location.hash,
+    href: location.href,
+    readyState: document.readyState,
+    initialMountDelay: INITIAL_MOUNT_DELAY,
+  })
+
+  mountButton()
+
+  if (!retryTimer) {
+    retryTimer = window.setInterval(() => {
+      if (!isTargetPage()) {
+        return
+      }
+
+      if (!document.getElementById(BUTTON_ID)) {
+        scheduleMount()
+      }
+    }, 1000)
+  }
+
+  if (!targetObserver && document.body) {
+    targetObserver = new MutationObserver(() => {
+      if (!isTargetPage() || document.getElementById(BUTTON_ID)) {
+        return
+      }
+
+      scheduleMount(100)
+    })
+    targetObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+    })
+  }
+
+  window.setTimeout(() => {
+    log('initial delayed mount')
+    scheduleMount()
+  }, INITIAL_MOUNT_DELAY)
+}
+
+const leaveTargetPage = () => {
+  window.clearTimeout(mountTimer)
+  mountTimer = 0
+  window.clearInterval(retryTimer)
+  retryTimer = 0
+  targetObserver?.disconnect()
+  targetObserver = null
+  activeButton?.remove()
+  activeButton = null
+  document.getElementById(STATUS_ID)?.remove()
+  document.getElementById(MODAL_ID)?.remove()
+}
+
+const syncRoute = () => {
+  if (isTargetPage()) {
+    enterTargetPage()
+    return
+  }
+
+  leaveTargetPage()
+  showStatus(`Easek loaded, waiting target page: ${location.hash || '(no hash)'}`)
+}
+
+const start = () => {
   log('loaded', {
     hash: location.hash,
     href: location.href,
@@ -812,24 +1186,9 @@ const start = () => {
     initialMountDelay: INITIAL_MOUNT_DELAY,
   })
 
-  window.setTimeout(() => {
-    log('initial delayed mount')
-    mountButton()
-  }, INITIAL_MOUNT_DELAY)
-
-  window.setInterval(() => {
-    mountButton()
-  }, 1000)
-
-  const observer = new MutationObserver(() => {
-    mountButton()
-  })
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-  })
-
-  window.addEventListener('hashchange', mountButton)
+  syncRoute()
+  window.addEventListener('hashchange', syncRoute)
+  window.addEventListener('popstate', syncRoute)
 }
 
 const app = () => {

@@ -9,6 +9,7 @@
     "dev": "concurrently -k -n server,bundle \"vite --mode development --host 127.0.0.1\" \"vite build --mode development --watch\"",
     "build:dev": "vite build --mode development",
     "build": "pnpm lint:fix && vite build --mode production",
+    "build:store": "pnpm lint:fix && vite build --mode store",
     "typecheck": "tsc --noEmit",
     "lint": "eslint --ext .ts --ext .tsx src/",
     "lint:fix": "pnpm lint --fix"

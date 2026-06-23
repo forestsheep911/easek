@@ -163,14 +163,16 @@ function userscriptBundlePlugin(loaderFileName: string, scriptFileName: string, 
 
 export default defineConfig(({ mode }) => {
   const isProduction = mode === 'production'
+  const isStore = mode === 'store'
+  const isRelease = isProduction || isStore
   const scriptName = String(commonMeta.name)
   const devScriptFileName = `${scriptName}.script.js`
   const loaderFileName = `${scriptName}.loader.user.js`
-  const outputDir = isProduction ? productionOutputDir : devOutputDir
-  const outputFileName = isProduction ? `${scriptName}.user.js` : devScriptFileName
+  const outputDir = isRelease ? productionOutputDir : devOutputDir
+  const outputFileName = isRelease ? `${scriptName}.user.js` : devScriptFileName
 
   return {
-    plugins: [userscriptBundlePlugin(loaderFileName, devScriptFileName, isProduction)],
+    plugins: [userscriptBundlePlugin(loaderFileName, devScriptFileName, isRelease)],
     publicDir: false,
     resolve: {
       alias: {
@@ -178,7 +180,7 @@ export default defineConfig(({ mode }) => {
       },
     },
     define: {
-      PRODUCTION: JSON.stringify(isProduction),
+      PRODUCTION: JSON.stringify(isRelease),
       FILENAME: JSON.stringify(`/dev/${loaderFileName}`),
     },
     server: {
@@ -192,8 +194,8 @@ export default defineConfig(({ mode }) => {
       outDir: outputDir,
       emptyOutDir: false,
       minify: isProduction,
-      sourcemap: !isProduction,
-      target: 'es2017',
+      sourcemap: !isRelease,
+      target: 'es2020',
       lib: {
         entry: path.resolve(srcRoot, 'index.ts'),
         name: 'TampermonkeyApp',
@@ -202,6 +204,7 @@ export default defineConfig(({ mode }) => {
       },
       rollupOptions: {
         output: {
+          compact: false,
           inlineDynamicImports: true,
         },
       },
